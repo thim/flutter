@@ -80,6 +80,9 @@ class BuildIOSFrameworkCommand extends BuildSubCommand {
       ..addFlag('cocoapods',
         help: 'Produce a Flutter.podspec instead of an engine Flutter.framework (recomended if host app uses CocoaPods).',
       )
+      ..addFlag('strip-bitcode',
+        help: 'Strip bitcode when creating frameworks.',
+      )
       ..addOption('output',
         abbr: 'o',
         valueHelp: 'path/to/directory/',
@@ -167,6 +170,8 @@ class BuildIOSFrameworkCommand extends BuildSubCommand {
 
     final Directory outputDirectory = globals.fs.directory(globals.fs.path.absolute(globals.fs.path.normalize(outputArgument)));
 
+    final stripBitCode = boolArg('strip-bitcode');
+
     for (final BuildMode mode in buildModes) {
       globals.printStatus('Building frameworks for $iosProject in ${getNameForBuildMode(mode)} mode...');
       final String xcodeBuildConfiguration = toTitleCase(getNameForBuildMode(mode));
@@ -186,14 +191,16 @@ class BuildIOSFrameworkCommand extends BuildSubCommand {
         // Copy Flutter.framework.
         await _produceFlutterFramework(mode, modeDirectory);
       }
+      
+      final stripBitCode = boolArg('strip-bitcode');
 
       // Build aot, create module.framework and copy.
-      await _produceAppFramework(mode, iPhoneBuildOutput, simulatorBuildOutput, modeDirectory);
+      await _produceAppFramework(mode, iPhoneBuildOutput, simulatorBuildOutput, modeDirectory, stripBitCode);
 
       // Build and copy plugins.
       await processPodsIfNeeded(_project.ios, getIosBuildDirectory(), mode);
       if (hasPlugins(_project)) {
-        await _producePlugins(mode, xcodeBuildConfiguration, iPhoneBuildOutput, simulatorBuildOutput, modeDirectory, outputDirectory);
+        await _producePlugins(mode, xcodeBuildConfiguration, iPhoneBuildOutput, simulatorBuildOutput, modeDirectory, outputDirectory, stripBitCode);
       }
 
       final Status status = globals.logger.startProgress(
@@ -234,11 +241,11 @@ class BuildIOSFrameworkCommand extends BuildSubCommand {
       // new artifacts when the source URL changes.
       final int minorHotfixVersion = gitTagVersion.z * 100 + (gitTagVersion.hotfix ?? 0);
 
-      final File license = _cache.getLicenseFile();
-      if (!license.existsSync()) {
+      final File license = _cache?.getLicenseFile();
+      if (license != null && !license.existsSync()) {
         throwToolExit('Could not find license at ${license.path}');
       }
-      final String licenseSource = license.readAsStringSync();
+      final String licenseSource = license?.readAsStringSync() ?? "";
       final String artifactsMode = mode == BuildMode.debug ? 'ios' : 'ios-${mode.name}';
 
       final String podspecContents = '''
@@ -257,7 +264,7 @@ $licenseSource
 LICENSE
   }
   s.author                = { 'Flutter Dev Team' => 'flutter-dev@googlegroups.com' }
-  s.source                = { :http => '${_cache.storageBaseUrl}/flutter_infra/flutter/${_cache.engineRevision}/$artifactsMode/artifacts.zip' }
+  s.source                = { :http => '${_cache?.storageBaseUrl}/flutter_infra/flutter/${_cache?.engineRevision}/$artifactsMode/artifacts.zip' }
   s.documentation_url     = 'https://flutter.dev/docs'
   s.platform              = :ios, '8.0'
   s.vendored_frameworks   = 'Flutter.framework'
@@ -332,7 +339,7 @@ end
     _produceXCFramework(mode, fatFlutterFrameworkCopy);
   }
 
-  Future<void> _produceAppFramework(BuildMode mode, Directory iPhoneBuildOutput, Directory simulatorBuildOutput, Directory modeDirectory) async {
+  Future<void> _produceAppFramework(BuildMode mode, Directory iPhoneBuildOutput, Directory simulatorBuildOutput, Directory modeDirectory, bool stripBitcode) async {
     const String appFrameworkName = 'App.framework';
     final Directory destinationAppFrameworkDirectory = modeDirectory.childDirectory(appFrameworkName);
 
@@ -345,7 +352,7 @@ end
         status.stop();
       }
     } else {
-      await _produceAotAppFrameworkIfNeeded(mode, modeDirectory);
+      await _produceAotAppFrameworkIfNeeded(mode, modeDirectory, stripBitcode);
     }
 
     final File sourceInfoPlist = _project.ios.hostAppRoot.childDirectory('Flutter').childFile('AppFrameworkInfo.plist');
@@ -408,6 +415,7 @@ end
   Future<void> _produceAotAppFrameworkIfNeeded(
     BuildMode mode,
     Directory destinationDirectory,
+    bool stripBitCode
   ) async {
     if (mode == BuildMode.debug) {
       return;
@@ -424,7 +432,7 @@ end
         // Relative paths show noise in the compiler https://github.com/dart-lang/sdk/issues/37978.
         mainDartFile: globals.fs.path.absolute(targetFile),
         quiet: true,
-        bitcode: true,
+        bitcode: !stripBitCode,
         reportTimings: false,
         iosBuildArchs: <DarwinArch>[DarwinArch.armv7, DarwinArch.arm64],
         dartDefines: dartDefines,
@@ -441,6 +449,7 @@ end
     Directory simulatorBuildOutput,
     Directory modeDirectory,
     Directory outputDirectory,
+    bool stripBitCode
   ) async {
     final Status status = globals.logger.startProgress(
       ' ├─Building plugins...', timeout: timeoutConfiguration.slowOperation);
@@ -451,8 +460,8 @@ end
       // of Flutter.framework (Release).
       _project.ios.copyEngineArtifactToProject(mode);
 
-      final String bitcodeGenerationMode = mode == BuildMode.release ?
-          'bitcode' : 'marker'; // In release, force bitcode embedding without archiving.
+      final String bitcodeGenerationMode = (mode == BuildMode.release && !stripBitCode)?
+         'bitcode' : 'marker'; // In release, force bitcode embedding without archiving.
 
       List<String> pluginsBuildCommand = <String>[
         'xcrun',
@@ -463,6 +472,8 @@ end
         '-configuration',
         xcodeBuildConfiguration,
         'SYMROOT=${iPhoneBuildOutput.path}',
+        if (stripBitCode)
+          'ENABLE_BITCODE=NO',
         'BITCODE_GENERATION_MODE=$bitcodeGenerationMode',
         'ONLY_ACTIVE_ARCH=NO' // No device targeted, so build all valid architectures.
       ];
@@ -488,7 +499,9 @@ end
           xcodeBuildConfiguration,
           'SYMROOT=${simulatorBuildOutput.path}',
           'ARCHS=x86_64',
-          'ONLY_ACTIVE_ARCH=NO'
+          if (stripBitCode)
+            ...['ONLY_ACTIVE_ARCH=NO',
+                'ENABLE_BITCODE=NO']
           // No device targeted, so build all valid architectures.
         ];
 
@@ -523,6 +536,7 @@ end
           if (globals.fs.path.extension(podFrameworkName) != '.framework') {
             continue;
           }
+          globals.logger.printStatus('podFrameworkName: $podFrameworkName');
           final String binaryName = globals.fs.path.basenameWithoutExtension(podFrameworkName);
           if (boolArg('universal')) {
             fsUtils.copyDirectorySync(
